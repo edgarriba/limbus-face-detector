@@ -3,3 +3,4 @@ kornia_rs
 limbus
 limbus_components
 opencv-python
+aioprocessing

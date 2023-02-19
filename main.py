@@ -3,7 +3,11 @@ from __future__ import annotations
 from pathlib import Path
 import asyncio
 import logging
+import multiprocessing as mp
+import aioprocessing as amp
+import time
 
+import torch
 import cv2
 import kornia as K
 import kornia_rs as KRS
@@ -12,26 +16,40 @@ from limbus.core.app import App
 
 
 class DataGenerator(Component):
-    def __init__(self, name: str, root: Path):
+    def __init__(self, name: str, root: Path, num_processes: int = 1) -> None:
         super().__init__(name)
-        self.root = root
-        self.files = list(self.root.rglob("*.jpg"))
-        self.index = 0
+        self.files: list[Path] = list(root.rglob("*.jpg"))
+        num_splits = len(self.files) // num_processes
+        self.split_files = [
+            self.files[i * num_splits:(i + 1) * num_splits]
+            for i in range(num_processes)]
+
+        self.queue = amp.AioQueue()
+        self.process = [
+            amp.AioProcess(target=self._run, args=(split_files, self.queue))
+            for split_files in self.split_files]
+        for p in self.process:
+            p.start()
 
     @staticmethod
     def register_outputs(outputs: OutputParams) -> None:
         outputs.declare("data")
+        outputs.declare("t0")
+    
+    def _run(self, files, queue):
+        for file in files:
+            img = cv2.imread(str(file))
+            img_t = K.utils.image_to_tensor(img).float()
+            img_t = K.color.bgr_to_rgb(img_t)
+            #img_t = K.geometry.rescale(img_t, 0.5)
+            # queue.put(torch.to_dlpack(img_t))
+            queue.put(img_t)
 
     async def forward(self):
-        if self.index >= len(self.files):
-            return ComponentState.FINISHED
-        file = self.files[self.index].absolute()
-        #img = torch.from_dlpack(KRS.read_image_rs(str(file)))
-        img = cv2.imread(str(file))
-        img_t = K.utils.image_to_tensor(img).float()
-        img_t = K.color.bgr_to_rgb(img_t)
-        await self.outputs.data.send(img_t)
-        self.index += 1
+        t0 = time.time()
+        data = await self.queue.coro_get()
+        await self.outputs.data.send(data.cuda())
+        await self.outputs.t0.send(t0)
         return ComponentState.OK
 
 
@@ -59,10 +77,10 @@ class AutoBatcher(Component):
         return ComponentState.OK
 
 
-class FaceDetectionComponent(Component):
+class FaceDetection(Component):
     def __init__(self, name: str):
         super().__init__(name)
-        self.model = K.contrib.FaceDetector()
+        self.model = K.contrib.FaceDetector().cuda()
 
     @staticmethod
     def register_inputs(inputs: InputParams) -> None:
@@ -75,8 +93,7 @@ class FaceDetectionComponent(Component):
     async def forward(self):
         img: K.core.Tensor = await self.inputs.data.receive()
         out: K.core.Tensor = self.model(img)
-        # TODO: handle image batch
-        dets = []
+        dets: list[list[K.contrib.FaceDetectorResult]] = []
         for o in out:
             dets.append([K.contrib.FaceDetectorResult(d) for d in o])
         await self.outputs.detections.send(dets)
@@ -91,10 +108,14 @@ class FaceDetectionViz(Component):
     def register_inputs(inputs: InputParams) -> None:
         inputs.declare("images")
         inputs.declare("detections")
+        inputs.declare("t0")
 
     async def forward(self):
-        imgs, detections = await asyncio.gather(
-            self.inputs.images.receive(), self.inputs.detections.receive())
+        imgs, detections, t0 = await asyncio.gather(
+            self.inputs.images.receive(),
+            self.inputs.detections.receive(),
+            self.inputs.t0.receive()
+        )
         assert len(imgs.shape) == 4, imgs.shape
 
         for img_t, dets in zip(imgs, detections):
@@ -106,24 +127,10 @@ class FaceDetectionViz(Component):
                 x1, y1 = d.top_left.int().tolist()
                 x2, y2 = d.bottom_right.int().tolist()
                 img_vis = cv2.rectangle(img_vis, (x1, y1), (x2, y2), (0, 255, 0), 2)
-        #await self.outputs.img.send(img)
-        cv2.imshow(self.name, img_vis)
-        cv2.waitKey(1000)
-        return ComponentState.OK
-
-
-class Logger(Component):
-    def __init__(self, name: str):
-        super().__init__(name)
-        self.log = logging.getLogger(name)
-
-    @staticmethod
-    def register_inputs(inputs: InputParams) -> None:
-        inputs.declare("data")
-
-    async def forward(self):
-        data = await self.inputs.data.receive()
-        self.log.info(data.shape)
+        t1 = time.time()
+        print(f"FPS: {1 / (t1 - t0)}")
+        #cv2.imshow(self.name, img_vis)
+        #cv2.waitKey(1000)
         return ComponentState.OK
 
 
@@ -131,19 +138,16 @@ class FaceDetectionApp(App):
     def create_components(self):
         self.dataset = DataGenerator("data", Path("/home/edgar/data/WIDER_val"))
         self.batcher = AutoBatcher("batcher", batch_size=1)
-        self.detector = FaceDetectionComponent("detector")
-        #self.viz = ImageShow("viz")
+        self.detector = FaceDetection("detector")
         self.viz = FaceDetectionViz("viz")
-        self.logger = Logger("logger")
     
     def connect_components(self):
-        self.dataset.outputs.data >> self.logger.inputs.data
         self.dataset.outputs.data >> self.batcher.inputs.data
         self.batcher.outputs.data >> self.detector.inputs.data
         self.detector.outputs.detections >> self.viz.inputs.detections
         self.batcher.outputs.data >> self.viz.inputs.images
+        self.dataset.outputs.t0 >> self.viz.inputs.t0
 
 
 if __name__ == "__main__":
-    app = FaceDetectionApp()
-    asyncio.run(app.run())
+    asyncio.run(FaceDetectionApp().run())
