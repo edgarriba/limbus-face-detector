@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from dataclasses import dataclass
 import asyncio
 import logging
 import multiprocessing as mp
@@ -15,40 +16,73 @@ from limbus.core import Component, InputParams, OutputParams, ComponentState
 from limbus.core.app import App
 
 
+@dataclass
+class DataSample:
+    image: K.core.Tensor = None
+    image_path: Path = None
+    label: K.core.Tensor = None
+
+
 class DataGenerator(Component):
-    def __init__(self, name: str, root: Path, num_processes: int = 1) -> None:
+    def __init__(self, name: str, root: Path, images: Path, labels: Path, num_processes: int = 1) -> None:
         super().__init__(name)
-        self.files: list[Path] = list(root.rglob("*.jpg"))
-        num_splits = len(self.files) // num_processes
-        self.split_files = [
-            self.files[i * num_splits:(i + 1) * num_splits]
+        # load images
+        #self.image_files: list[Path] = list((root / "images").rglob("*.jpg"))
+        
+        # load labels
+        self.data = []
+        labels = open(labels).readlines()
+        labels_iter = iter(labels)
+        while True:
+            try:
+                line = next(labels_iter)
+            except StopIteration:
+                break
+            if ".jpg" in line:
+                image_path = Path(line.strip())
+                num_boxes = int(next(labels_iter).strip())
+                boxes = []
+                for _ in range(num_boxes):
+                    box = [int(x) for x in next(labels_iter).strip().split(" ")]
+                    boxes.append(box)
+                self.data.append(DataSample(
+                    image_path=(root / "images" / image_path),
+                    label=K.geometry.boxes.Boxes.from_tensor(torch.tensor(boxes)[..., :4], mode="xywh", validate_boxes=False)))
+
+        # split data
+        num_splits = len(self.data) // num_processes
+        self.data_split = [
+            self.data[i * num_splits:(i + 1) * num_splits]
             for i in range(num_processes)]
 
         self.queue = amp.AioQueue()
         self.process = [
-            amp.AioProcess(target=self._run, args=(split_files, self.queue))
-            for split_files in self.split_files]
+            amp.AioProcess(target=self._run, args=(data_split, self.queue))
+            for data_split in self.data_split]
         for p in self.process:
             p.start()
 
     @staticmethod
     def register_outputs(outputs: OutputParams) -> None:
-        outputs.declare("data")
+        outputs.declare("image")
+        outputs.declare("boxes")
         outputs.declare("t0")
     
-    def _run(self, files, queue):
-        for file in files:
-            img = cv2.imread(str(file))
+    def _run(self, data, queue):
+        for sample in data:
+            img = cv2.imread(str(sample.image_path))
             img_t = K.utils.image_to_tensor(img).float()
             img_t = K.color.bgr_to_rgb(img_t)
-            #img_t = K.geometry.rescale(img_t, 0.5)
-            # queue.put(torch.to_dlpack(img_t))
-            queue.put(img_t)
+            sample.image = img_t
+            queue.put(sample)
 
     async def forward(self):
         t0 = time.time()
-        data = await self.queue.coro_get()
-        await self.outputs.data.send(data.cuda())
+        sample: DataSample = await self.queue.coro_get()
+        await asyncio.gather(
+            self.outputs.image.send(sample.image.cuda()),
+            self.outputs.boxes.send(sample.label)
+        )
         await self.outputs.t0.send(t0)
         return ComponentState.OK
 
@@ -134,17 +168,42 @@ class FaceDetectionViz(Component):
         return ComponentState.OK
 
 
+class FaceDetectorMetric(Component):
+    def __init__(self, name: str):
+        super().__init__(name)
+    
+    @staticmethod
+    def register_inputs(inputs: InputParams) -> None:
+        inputs.declare("detections")
+        inputs.declare("boxes")
+    
+    async def forward(self):
+        detections, boxes = await asyncio.gather(
+            self.inputs.detections.receive(),
+            self.inputs.boxes.receive()
+        )
+        pass
+        return ComponentState.OK
+
+
 class FaceDetectionApp(App):
     def create_components(self):
-        self.dataset = DataGenerator("data", Path("/home/edgar/data/WIDER_val"))
+        self.dataset = DataGenerator(
+            "data",
+            root=Path("/home/edgar/data/WIDER_val"),
+            images=Path("/home/edgar/data/WIDER_val"),
+            labels=Path("/home/edgar/Downloads/wider_face_split/wider_face_val_bbx_gt.txt"))
         self.batcher = AutoBatcher("batcher", batch_size=1)
         self.detector = FaceDetection("detector")
         self.viz = FaceDetectionViz("viz")
+        self.metric = FaceDetectorMetric("metric")
     
     def connect_components(self):
-        self.dataset.outputs.data >> self.batcher.inputs.data
+        self.dataset.outputs.image >> self.batcher.inputs.data
+        self.dataset.outputs.boxes >> self.metric.inputs.boxes
         self.batcher.outputs.data >> self.detector.inputs.data
         self.detector.outputs.detections >> self.viz.inputs.detections
+        self.detector.outputs.detections >> self.metric.inputs.detections
         self.batcher.outputs.data >> self.viz.inputs.images
         self.dataset.outputs.t0 >> self.viz.inputs.t0
 
