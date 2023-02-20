@@ -3,19 +3,20 @@ from __future__ import annotations
 from pathlib import Path
 from dataclasses import dataclass
 import asyncio
-import logging
-import multiprocessing as mp
 import aioprocessing as amp
 import time
 
 import torch
 import cv2
+
 import kornia as K
-import kornia_rs as KRS
+from kornia.geometry.boxes import Boxes
+
 from limbus.core import Component, InputParams, OutputParams, ComponentState 
 from limbus.core.app import App
 
-from metrics import FaceDetectorMetric
+from metrics import ConfusionMatrix
+
 
 @dataclass
 class DataSample:
@@ -48,7 +49,7 @@ class DataGenerator(Component):
                     boxes.append(box)
                 self.data.append(DataSample(
                     image_path=(root / "images" / image_path),
-                    label=K.geometry.boxes.Boxes.from_tensor(torch.tensor(boxes)[..., :4], mode="xywh", validate_boxes=False)))
+                    label=Boxes.from_tensor(torch.tensor(boxes)[..., :4], mode="xywh", validate_boxes=False)))
 
         # split data
         num_splits = len(self.data) // num_processes
@@ -168,6 +169,46 @@ class FaceDetectionViz(Component):
         print(f"FPS: {1 / (t1 - t0)}")
         #cv2.imshow(self.name, img_vis)
         #cv2.waitKey(1000)
+        return ComponentState.OK
+
+
+class FaceDetectorMetric(Component):
+    def __init__(self, name: str):
+        super().__init__(name)
+        self.cm = ConfusionMatrix(nc=1)
+        #self.counter = 0
+    
+    @staticmethod
+    def register_inputs(inputs: InputParams) -> None:
+        inputs.declare("detections", K.contrib.FaceDetectorResult)
+        inputs.declare("boxes", Boxes)
+    
+    async def forward(self):
+        batched_detections, batched_boxes_gt = await asyncio.gather(
+            self.inputs.detections.receive(),
+            self.inputs.boxes.receive()
+        )
+        # convert detections to Boxes
+        # TODO: handle batch properly
+        batched_boxes_gt.data.unsqueeze_(0)
+
+        for dets, boxes_gt in zip(batched_detections, batched_boxes_gt):
+            detections = torch.tensor(
+                [d.top_left.tolist() + d.bottom_right.tolist() + [d.score.item(), 0,] for d in dets]
+            )
+
+            labels = torch.cat((
+                torch.zeros_like(boxes_gt.data)[:, 0, :1],
+                boxes_gt.top_left(),
+                boxes_gt.bottom_right(),
+            ), dim=-1)
+
+            self.cm.process_batch(detections, labels)
+        
+        if self.counter % 10 == 0:
+            print(self.cm.matrix)
+            self.cm.plot()
+
         return ComponentState.OK
 
 
