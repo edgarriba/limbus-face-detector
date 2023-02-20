@@ -45,23 +45,24 @@ class FaceDetectorMetric(Component):
         inputs.declare("boxes", Boxes)
     
     async def forward(self):
-        detections, boxes_gt = await asyncio.gather(
+        batched_detections, batched_boxes_gt = await asyncio.gather(
             self.inputs.detections.receive(),
             self.inputs.boxes.receive()
         )
         # convert detections to Boxes
-        # TODO: hndle batch properly
-        boxes = []
-        for dets in detections:
-            boxes.append([d.top_left.tolist() + d.bottom_right.tolist() for d in dets])
-        boxes = Boxes.from_tensor(torch.tensor(boxes), mode="xyxy")
+        # TODO: handle batch properly
+        batched_boxes_gt.data.unsqueeze_(0)
 
-        # compute iou
-        iou = box_iou(boxes[0], boxes_gt)
+        for dets, boxes_gt in zip(batched_detections, batched_boxes_gt):
+            boxes = [d.top_left.tolist() + d.bottom_right.tolist() for d in dets]
+            boxes = Boxes.from_tensor(torch.tensor(boxes), mode="xyxy")
 
-        # compute confusion matrix
-        # TODO: this is not correct, just for debug
-        iou_thresh = 0.45
-        print(iou.mean())
-        pass
+            # compute iou
+            iou = box_iou(boxes, boxes_gt)
+
+            # compute confusion matrix
+            # TODO: this is not correct, just for debug
+            iou_thresh = 0.45
+            print(iou.mean())
+            pass
         return ComponentState.OK
