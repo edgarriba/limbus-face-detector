@@ -15,6 +15,7 @@ import kornia_rs as KRS
 from limbus.core import Component, InputParams, OutputParams, ComponentState 
 from limbus.core.app import App
 
+from metrics import FaceDetectorMetric
 
 @dataclass
 class DataSample:
@@ -68,8 +69,10 @@ class DataGenerator(Component):
         outputs.declare("boxes")
         outputs.declare("t0")
     
-    def _run(self, data, queue):
+    @staticmethod
+    def _run(data, queue):
         for sample in data:
+            assert sample.image_path.exists(), sample.image_path
             img = cv2.imread(str(sample.image_path))
             img_t = K.utils.image_to_tensor(img).float()
             img_t = K.color.bgr_to_rgb(img_t)
@@ -80,7 +83,7 @@ class DataGenerator(Component):
         t0 = time.time()
         sample: DataSample = await self.queue.coro_get()
         await asyncio.gather(
-            self.outputs.image.send(sample.image.cuda()),
+            self.outputs.image.send(sample.image),
             self.outputs.boxes.send(sample.label)
         )
         await self.outputs.t0.send(t0)
@@ -114,7 +117,7 @@ class AutoBatcher(Component):
 class FaceDetection(Component):
     def __init__(self, name: str):
         super().__init__(name)
-        self.model = K.contrib.FaceDetector().cuda()
+        self.model = K.contrib.FaceDetector()
 
     @staticmethod
     def register_inputs(inputs: InputParams) -> None:
@@ -165,24 +168,6 @@ class FaceDetectionViz(Component):
         print(f"FPS: {1 / (t1 - t0)}")
         #cv2.imshow(self.name, img_vis)
         #cv2.waitKey(1000)
-        return ComponentState.OK
-
-
-class FaceDetectorMetric(Component):
-    def __init__(self, name: str):
-        super().__init__(name)
-    
-    @staticmethod
-    def register_inputs(inputs: InputParams) -> None:
-        inputs.declare("detections")
-        inputs.declare("boxes")
-    
-    async def forward(self):
-        detections, boxes = await asyncio.gather(
-            self.inputs.detections.receive(),
-            self.inputs.boxes.receive()
-        )
-        pass
         return ComponentState.OK
 
 
